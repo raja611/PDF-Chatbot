@@ -1,0 +1,4 @@
+flask
+llama-index
+Flask-Session
+python-dotenv
