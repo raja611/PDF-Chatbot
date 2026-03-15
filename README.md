@@ -7,6 +7,8 @@ A Flask-based chatbot that lets you upload PDF or DOCX files and ask questions a
 ```
 pdf-chat/
 ├── app.py                    # Main Flask application
+├── guardrails.py             # Input/output guardrails (validation, PII, rate limiting)
+├── metrics.py                # Prometheus metrics definitions + Flask integration
 ├── benchmark_embeddings.py   # Embedding strategy benchmark script
 ├── Dockerfile                # Docker build file
 ├── .dockerignore             # Files excluded from Docker build
@@ -297,6 +299,146 @@ Total                      : 1778.1ms  (100%)
 | **Environment variables** | `.env` + `python-dotenv` | API keys not hardcoded in source |
 | **Cache warmup on upload** | Pre-loads index + engine after indexing | First query after upload has zero cold-start |
 
+## Guardrails
+
+The `guardrails.py` module protects the app from bad inputs and unsafe outputs.
+
+### Input guardrails
+
+| Check | Rule | Response |
+|---|---|---|
+| Empty input | Message cannot be blank | 400 + `EMPTY_INPUT` |
+| Too short | Min 2 characters | 400 + `INPUT_TOO_SHORT` |
+| Too long | Max 2000 characters | 400 + `INPUT_TOO_LONG` |
+| Prompt injection | Detects "ignore previous instructions", "act as", `<script>`, etc. | 400 + `INJECTION_DETECTED` |
+
+### File guardrails
+
+| Check | Rule | Response |
+|---|---|---|
+| No file | File field missing or empty | 400 + `NO_FILE` |
+| Wrong type | Only `.pdf` and `.docx` allowed | 400 + `INVALID_FILE_TYPE` |
+| Too large | Max 20 MB | 400 + `FILE_TOO_LARGE` |
+| Empty file | 0 bytes | 400 + `EMPTY_FILE` |
+
+### Output guardrails
+
+| Check | Action |
+|---|---|
+| PII detection | Scans for emails, phone numbers, SSNs, credit card numbers |
+| PII redaction | Replaces with `[REDACTED_EMAIL]`, `[REDACTED_PHONE]`, etc. |
+
+The response includes a `guardrails` field showing what was detected:
+
+```json
+{
+  "guardrails": {
+    "pii_detected": true,
+    "pii_types": ["email", "phone"],
+    "pii_redacted": true
+  }
+}
+```
+
+### Rate limiting
+
+- 20 queries per minute per session
+- Returns 429 + `RATE_LIMITED` when exceeded
+
+## Observability (Prometheus)
+
+The `metrics.py` module exposes Prometheus metrics at `GET /metrics`.
+
+### Available metrics
+
+**Counters:**
+
+| Metric | Labels | Description |
+|---|---|---|
+| `pdf_chatbot_requests_total` | method, endpoint, status | Total HTTP requests |
+| `pdf_chatbot_uploads_total` | file_type, status | File uploads (success/blocked/unsupported) |
+| `pdf_chatbot_queries_total` | status | Queries (success/blocked/rate_limited/error) |
+| `pdf_chatbot_guardrail_blocks_total` | guardrail_code | Requests blocked by guardrails |
+| `pdf_chatbot_pii_detections_total` | pii_type | PII found and redacted in output |
+| `pdf_chatbot_errors_total` | endpoint, error_type | Unhandled exceptions |
+
+**Histograms (latency):**
+
+| Metric | Description |
+|---|---|
+| `pdf_chatbot_upload_duration_seconds` | Total upload + indexing time |
+| `pdf_chatbot_upload_embed_duration_seconds` | Embedding-only time during upload |
+| `pdf_chatbot_query_duration_seconds` | Total query latency |
+| `pdf_chatbot_query_engine_load_seconds` | Engine load time per query |
+| `pdf_chatbot_query_rag_llm_seconds` | RAG + LLM response time |
+
+**Gauges:**
+
+| Metric | Description |
+|---|---|
+| `pdf_chatbot_active_requests` | Currently in-flight requests |
+| `pdf_chatbot_index_loaded` | 1 if index is in memory, 0 otherwise |
+| `pdf_chatbot_embedding_cache_entries` | Number of cached embeddings |
+
+### Scraping with Prometheus
+
+Add to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: "pdf-chatbot"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:5000"]
+```
+
+### Docker Compose with Prometheus + Grafana
+
+```yaml
+services:
+  pdf-chatbot:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      - uploads:/app/uploads
+      - storage:/app/storage
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
+volumes:
+  uploads:
+  storage:
+```
+
+Create `prometheus.yml` in the project root:
+
+```yaml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "pdf-chatbot"
+    static_configs:
+      - targets: ["pdf-chatbot:5000"]
+```
+
+Then: `docker compose up -d` and open Grafana at `http://localhost:3000` (admin/admin), add Prometheus as a data source (`http://prometheus:9090`).
+
 ## API Endpoints
 
 | Method | Path | Description |
@@ -305,6 +447,8 @@ Total                      : 1778.1ms  (100%)
 | POST | `/upload` | Upload a PDF or DOCX file for indexing |
 | POST | `/ask` | Optimized query (cached engine) |
 | POST | `/ask_no_cache` | Unoptimized query (reloads from disk, for benchmarking) |
+| GET | `/metrics` | Prometheus metrics endpoint |
+| GET | `/health` | Health check (index status, cache size) |
 
 ### POST /upload
 
@@ -344,6 +488,9 @@ Total                      : 1778.1ms  (100%)
     "history_build_ms": 0.0,
     "rag_llm_ms": 1276.7,
     "total_ms": 1276.7
+  },
+  "guardrails": {
+    "pii_detected": false
   }
 }
 ```
@@ -354,3 +501,4 @@ Total                      : 1778.1ms  (100%)
 - **LlamaIndex** -- Document indexing, embeddings, and RAG chat engine
 - **Flask-Session** -- Server-side session storage for chat history
 - **python-dotenv** -- Load environment variables from `.env`
+- **prometheus-client** -- Prometheus metrics exposition

@@ -14,7 +14,19 @@ import logging
 import hashlib
 import json
 
+from guardrails import validate_query, validate_file, check_rate_limit, check_output
+from metrics import (
+    register_metrics,
+    UPLOAD_COUNT, UPLOAD_LATENCY, UPLOAD_EMBED_LATENCY,
+    QUERY_COUNT, QUERY_LATENCY, QUERY_ENGINE_LATENCY, QUERY_RAG_LLM_LATENCY,
+    GUARDRAIL_BLOCKS, PII_DETECTIONS, ERRORS,
+    INDEX_LOADED, EMBEDDING_CACHE_SIZE,
+)
+
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -23,6 +35,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key")
 app.config['SESSION_TYPE'] = 'filesystem'
 Session(app)
+register_metrics(app)
 
 Settings.llm = OpenAI(api_key=OPENAI_API_KEY)
 Settings.embed_model = OpenAIEmbedding(
@@ -33,7 +46,7 @@ Settings.embed_model = OpenAIEmbedding(
 PERSIST_DIR = "./storage"
 EMBED_CACHE_DIR = "./embedding_cache"
 
-# ── In-memory caches ─────────────────────────────────────────────────────
+# -- In-memory caches ----------------------------------------------------------
 _index_cache = None
 _chat_engine_cache = None
 _embedding_mem_cache = {}
@@ -44,9 +57,11 @@ def get_cached_index(force_reload=False):
     global _index_cache
     if _index_cache is None or force_reload:
         if not os.path.exists(PERSIST_DIR):
+            INDEX_LOADED.set(0)
             return None
         storage_context = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
         _index_cache = load_index_from_storage(storage_context)
+        INDEX_LOADED.set(1)
     return _index_cache
 
 
@@ -67,6 +82,7 @@ def invalidate_caches():
     global _index_cache, _chat_engine_cache
     _index_cache = None
     _chat_engine_cache = None
+    INDEX_LOADED.set(0)
 
 
 def get_embed_cache_key(text):
@@ -95,6 +111,7 @@ def save_embedding_to_cache(text, embedding):
     cache_file = os.path.join(EMBED_CACHE_DIR, f"{key}.json")
     with open(cache_file, "w") as f:
         json.dump(embedding, f)
+    EMBEDDING_CACHE_SIZE.set(len(_embedding_mem_cache))
 
 
 template = RichPromptTemplate("""
@@ -119,8 +136,15 @@ def index_page():
 def upload():
     t_start = time.perf_counter()
 
-    file = request.files['file']
+    file = request.files.get("file")
+    file_check = validate_file(file)
+    if not file_check:
+        GUARDRAIL_BLOCKS.labels(guardrail_code=file_check.code).inc()
+        UPLOAD_COUNT.labels(file_type="unknown", status="blocked").inc()
+        return jsonify({"status": "error", "message": file_check.message, "code": file_check.code}), 400
+
     filename = file.filename.lower()
+    ext = filename.rsplit(".", 1)[-1]
 
     saved_path = os.path.join("uploads", file.filename)
     os.makedirs("uploads", exist_ok=True)
@@ -132,7 +156,8 @@ def upload():
     elif filename.endswith(".docx"):
         documents = DocxReader().load_data(file=saved_path)
     else:
-        return jsonify({"status": "error", "message": "Unsupported file type"})
+        UPLOAD_COUNT.labels(file_type=ext, status="unsupported").inc()
+        return jsonify({"status": "error", "message": "Unsupported file type"}), 400
     t_parse = time.perf_counter()
 
     index = VectorStoreIndex.from_documents(documents, show_progress=True)
@@ -148,15 +173,22 @@ def upload():
 
     session['chat_history'] = []
 
+    total_s = t_warmup - t_start
+    embed_s = t_embed - t_parse
+
     timings = {
         "file_save_ms": round((t_save - t_start) * 1000, 1),
         "parse_ms": round((t_parse - t_save) * 1000, 1),
-        "embed_index_ms": round((t_embed - t_parse) * 1000, 1),
+        "embed_index_ms": round(embed_s * 1000, 1),
         "persist_ms": round((t_persist - t_embed) * 1000, 1),
         "cache_warmup_ms": round((t_warmup - t_persist) * 1000, 1),
-        "total_ms": round((t_warmup - t_start) * 1000, 1),
+        "total_ms": round(total_s * 1000, 1),
     }
-    logging.info(f"Upload timings: {timings}")
+
+    UPLOAD_LATENCY.observe(total_s)
+    UPLOAD_EMBED_LATENCY.observe(embed_s)
+    UPLOAD_COUNT.labels(file_type=ext, status="success").inc()
+    logger.info(f"Upload timings: {timings}")
 
     return jsonify({"status": "success", "timings_ms": timings})
 
@@ -165,13 +197,30 @@ def upload():
 def ask():
     t_start = time.perf_counter()
 
-    user_input = request.json.get("message")
+    user_input = request.json.get("message") if request.is_json else None
+
+    # -- Guardrails: input validation --
+    input_check = validate_query(user_input)
+    if not input_check:
+        GUARDRAIL_BLOCKS.labels(guardrail_code=input_check.code).inc()
+        QUERY_COUNT.labels(status="blocked").inc()
+        return jsonify({"answer": input_check.message, "code": input_check.code}), 400
+
+    # -- Guardrails: rate limiting --
+    sid = session.sid if hasattr(session, "sid") else request.remote_addr
+    rate_check = check_rate_limit(str(sid))
+    if not rate_check:
+        GUARDRAIL_BLOCKS.labels(guardrail_code=rate_check.code).inc()
+        QUERY_COUNT.labels(status="rate_limited").inc()
+        return jsonify({"answer": rate_check.message, "code": rate_check.code}), 429
 
     if not os.path.exists(PERSIST_DIR):
         return jsonify({"answer": "Please upload a file first."})
 
     chat_engine = get_cached_engine()
     t_engine = time.perf_counter()
+    engine_s = t_engine - t_start
+    QUERY_ENGINE_LATENCY.observe(engine_s)
 
     if chat_engine is None:
         return jsonify({"answer": "Please upload a file first."})
@@ -187,36 +236,57 @@ def ask():
     try:
         response = chat_engine.chat(user_input, chat_history)
         t_llm = time.perf_counter()
+        rag_llm_s = t_llm - t_history
+
+        # -- Guardrails: output safety --
+        answer_text, output_meta = check_output(response.response)
+        if output_meta.get("pii_detected"):
+            for pii_type in output_meta.get("pii_types", []):
+                PII_DETECTIONS.labels(pii_type=pii_type).inc()
 
         raw_history.append({
             "user": user_input,
-            "assistant": response.response
+            "assistant": answer_text,
         })
         session['chat_history'] = raw_history
 
+        total_s = t_llm - t_start
         timings = {
-            "engine_load_ms": round((t_engine - t_start) * 1000, 1),
+            "engine_load_ms": round(engine_s * 1000, 1),
             "history_build_ms": round((t_history - t_engine) * 1000, 1),
-            "rag_llm_ms": round((t_llm - t_history) * 1000, 1),
-            "total_ms": round((t_llm - t_start) * 1000, 1),
+            "rag_llm_ms": round(rag_llm_s * 1000, 1),
+            "total_ms": round(total_s * 1000, 1),
         }
 
+        QUERY_LATENCY.observe(total_s)
+        QUERY_RAG_LLM_LATENCY.observe(rag_llm_s)
+        QUERY_COUNT.labels(status="success").inc()
+
         return jsonify({
-            "answer": response.response,
+            "answer": answer_text,
             "history": raw_history,
             "timings_ms": timings,
+            "guardrails": output_meta,
         })
 
     except Exception as e:
-        return jsonify({"answer": f"An error occurred: {str(e)}"})
+        ERRORS.labels(endpoint="/ask", error_type=type(e).__name__).inc()
+        QUERY_COUNT.labels(status="error").inc()
+        logger.exception("Error in /ask")
+        return jsonify({"answer": f"An error occurred: {str(e)}"}), 500
 
 
 @app.route("/ask_no_cache", methods=["POST"])
 def ask_no_cache():
-    """Unoptimized endpoint — reloads index from disk every time (for benchmarking)."""
+    """Unoptimized endpoint for benchmarking (reloads index from disk every time)."""
     t_start = time.perf_counter()
 
-    user_input = request.json.get("message")
+    user_input = request.json.get("message") if request.is_json else None
+
+    input_check = validate_query(user_input)
+    if not input_check:
+        GUARDRAIL_BLOCKS.labels(guardrail_code=input_check.code).inc()
+        return jsonify({"answer": input_check.message, "code": input_check.code}), 400
 
     if not os.path.exists(PERSIST_DIR):
         return jsonify({"answer": "Please upload a file first."})
@@ -238,6 +308,8 @@ def ask_no_cache():
         response = chat_engine.chat(user_input, chat_history)
         t_llm = time.perf_counter()
 
+        answer_text, output_meta = check_output(response.response)
+
         timings = {
             "index_load_ms": round((t_index - t_start) * 1000, 1),
             "engine_create_ms": round((t_engine - t_index) * 1000, 1),
@@ -245,13 +317,26 @@ def ask_no_cache():
             "total_ms": round((t_llm - t_start) * 1000, 1),
         }
 
+        QUERY_LATENCY.observe(t_llm - t_start)
+
         return jsonify({
-            "answer": response.response,
+            "answer": answer_text,
             "timings_ms": timings,
         })
 
     except Exception as e:
-        return jsonify({"answer": f"An error occurred: {str(e)}"})
+        ERRORS.labels(endpoint="/ask_no_cache", error_type=type(e).__name__).inc()
+        logger.exception("Error in /ask_no_cache")
+        return jsonify({"answer": f"An error occurred: {str(e)}"}), 500
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "healthy",
+        "index_loaded": _index_cache is not None,
+        "embedding_cache_size": len(_embedding_mem_cache),
+    })
 
 
 if __name__ == "__main__":
