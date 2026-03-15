@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+storage/
+flask_session/
+embedding_cache/
+uploads/
+.git/
+.gitignore
+*.md
+benchmark_embeddings.py
